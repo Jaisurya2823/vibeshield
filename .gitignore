@@ -1,0 +1,25 @@
+# Secrets -- never commit real API keys
+.env
+*.env
+!.env.example
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local manual test scratch folder (not the tracked fixtures under tests/fixtures)
+manual_test_inputs/
+**/.vibeshield-baseline.json

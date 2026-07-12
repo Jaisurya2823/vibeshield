@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test suite
+        # No GROQ_API_KEY is set here on purpose -- CI must prove the tool
+        # works completely offline (static rules only). Tests that need a
+        # live key are in test_real_groq_call.py, which is NOT run here;
+        # that one is a manual, local-only diagnostic, never a CI check --
+        # a real API key has no business living in a CI secret for this repo.
+        run: |
+          PYTHONPATH=src python -m pytest tests/ -v
+
+      - name: Run accuracy benchmark (precision/recall gate)
+        # Fails the build if any category's detection regresses against the
+        # labeled ground-truth corpus in benchmark/cases.py -- catches a
+        # broken regex accidentally reducing recall, or a pattern becoming
+        # too broad and reducing precision, before it reaches a release.
+        run: |
+          PYTHONPATH=src:benchmark python benchmark/run_benchmark.py
+
+      - name: Confirm zero network calls in default (no-key) test run
+        run: |
+          echo "This job ran with no GROQ_API_KEY environment variable set."
+          echo "All tests and the accuracy benchmark passing here confirms static-only detection works with zero external calls."

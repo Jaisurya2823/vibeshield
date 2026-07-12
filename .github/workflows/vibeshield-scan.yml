@@ -1,0 +1,27 @@
+name: vibeshield-scan
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -e .
+      - name: Run vibeshield scan
+        run: |
+          source .venv/bin/activate
+          python -m vibeshield --offline src/vibeshield
