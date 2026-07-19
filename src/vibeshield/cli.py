@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from rich.table import Table
 from .baseline import load_baseline, save_baseline, split_by_baseline
 from .graph import run_graph
 from .reporting import build_report_summary
+from .sarif_export import build_sarif
 
 load_dotenv()
 
@@ -31,6 +33,10 @@ def main(
     no_baseline: bool = typer.Option(
         False, "--no-baseline",
         help="Ignore any existing baseline file and show every finding, including previously accepted ones.",
+    ),
+    sarif: str = typer.Option(
+        None, "--sarif",
+        help="Write results as a SARIF 2.1.0 file at this path, for GitHub Code Scanning / IDE integration.",
     ),
 ) -> None:
     resolved_path = Path(path).resolve()
@@ -62,6 +68,12 @@ def main(
 
     console.print(Panel.fit(f"vibeshield report for {resolved_path}", style="bold cyan"))
     console.print("\n[bold]Executive summary[/bold]")
+
+    if sarif:
+        sarif_doc = build_sarif(state)
+        sarif_path = Path(sarif)
+        sarif_path.write_text(json.dumps(sarif_doc, indent=2), encoding="utf-8")
+        console.print(f"[dim]SARIF report written to {sarif_path} ({len(state.vulnerabilities)} result(s)).[/dim]")
 
     if update_baseline:
         console.print(

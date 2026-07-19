@@ -2,11 +2,23 @@ from __future__ import annotations
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..groq_client import GroqClient
 from ..hallucination_filter import verify_evidence
 from ..comment_masking import mask_python_docstrings
 from ..state import GraphState, RiskSurface
+
+# LLM calls are the actual bottleneck for "online mode" -- each one is an
+# independent network round-trip per file, and running them sequentially on
+# a real repo (dozens to hundreds of eligible files) is where most of the
+# wall-clock time goes. These are I/O-bound (waiting on the network, not
+# CPU), so a thread pool gives a real speedup without the complexity of a
+# full async rewrite. Kept conservative (not "as many as possible") because
+# too much concurrency just shifts the bottleneck to Groq's own rate limits,
+# triggering the retry/backoff logic more often instead of actually finishing
+# faster.
+MAX_CONCURRENT_LLM_CALLS = 10
 
 ENTRY_POINT_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("HTTP request handler", re.compile(r"@app\.route\(")),
@@ -94,7 +106,7 @@ def _line_number_from_snippet(content: str, snippet: str) -> int | None:
 
 def _llm_findings(file, client: GroqClient) -> list[RiskSurface]:
     _, ext = os.path.splitext(file.rel_path)
-    if ext not in LLM_ELIGIBLE_EXTENSIONS or not file.content.strip():
+    if ext.lower() not in LLM_ELIGIBLE_EXTENSIONS or not file.content.strip():
         return []
 
     result = client.analyze_json(
@@ -127,7 +139,7 @@ def classify_risk_surface(state: GraphState) -> GraphState:
 
     for file in state.files:
         filename = file.rel_path.rsplit("/", 1)[-1]
-        scan_content = mask_python_docstrings(file.content) if filename.endswith(".py") else file.content
+        scan_content = mask_python_docstrings(file.content) if filename.lower().endswith(".py") else file.content
         for entry_point, pattern in ENTRY_POINT_PATTERNS:
             for match in pattern.finditer(scan_content):
                 surfaces.append(
@@ -141,8 +153,11 @@ def classify_risk_surface(state: GraphState) -> GraphState:
                     )
                 )
 
-        if client.enabled:
-            surfaces.extend(_llm_findings(file, client))
+    if client.enabled:
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_CALLS) as executor:
+            futures = [executor.submit(_llm_findings, file, client) for file in state.files]
+            for future in as_completed(futures):
+                surfaces.extend(future.result())
 
     state.risk_surfaces = surfaces
 

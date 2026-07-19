@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from ..groq_client import GroqClient
 from ..state import GraphState
+
+# Same rationale as classify_risk_surface.py: these are independent,
+# I/O-bound network calls, and running them one at a time was the other
+# half of "online mode is slow" on repos with many findings.
+MAX_CONCURRENT_LLM_CALLS = 5
 
 STATIC_REMEDIATION = {
     "sql_injection": "Use parameterized queries and validate all input before database access.",
@@ -43,6 +50,21 @@ def _file_context(files, rel_path: str, line: int | None, radius: int = 5) -> st
     return ""
 
 
+def _enrich_one(vuln, static_fix: str, files, client: GroqClient) -> str | None:
+    context = _file_context(files, vuln.rel_path, vuln.line)
+    if not context.strip():
+        return None
+    result = client.analyze_json(
+        LLM_REMEDIATE_SYSTEM_PROMPT,
+        f"Category: {vuln.category}\nSeverity: {vuln.severity}\n"
+        f"File: {vuln.rel_path}\nEvidence: {vuln.evidence}\n\n"
+        f"Surrounding code:\n{context}",
+    )
+    if result and isinstance(result, dict) and result.get("remediation"):
+        return result["remediation"]
+    return None
+
+
 def explain_remediate(state: GraphState) -> GraphState:
     if not state.vulnerabilities:
         state.findings.append("No vulnerabilities detected")
@@ -52,23 +74,28 @@ def explain_remediate(state: GraphState) -> GraphState:
     enriched_count = 0
 
     for vuln in state.vulnerabilities:
-        static_fix = STATIC_REMEDIATION.get(
+        vuln.remediation = STATIC_REMEDIATION.get(
             vuln.category, "Review the affected code path and apply a least-privilege fix."
         )
-        vuln.remediation = static_fix
 
-        if client.enabled and vuln.category not in LLM_EXCLUDED_CATEGORIES:
-            context = _file_context(state.files, vuln.rel_path, vuln.line)
-            if context.strip():
-                result = client.analyze_json(
-                    LLM_REMEDIATE_SYSTEM_PROMPT,
-                    f"Category: {vuln.category}\nSeverity: {vuln.severity}\n"
-                    f"File: {vuln.rel_path}\nEvidence: {vuln.evidence}\n\n"
-                    f"Surrounding code:\n{context}",
-                )
-                if result and isinstance(result, dict) and result.get("remediation"):
-                    vuln.remediation = f"{static_fix}\n\nContext-specific suggestion: {result['remediation']}"
-                    enriched_count += 1
+    if client.enabled:
+        eligible = [v for v in state.vulnerabilities if v.category not in LLM_EXCLUDED_CATEGORIES]
+        if eligible:
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LLM_CALLS) as executor:
+                future_to_vuln = {
+                    executor.submit(_enrich_one, v, v.remediation, state.files, client): v
+                    for v in eligible
+                }
+                # Mutation of Vulnerability objects happens only here, in the
+                # main thread, after each future resolves -- worker threads
+                # never touch shared state directly, so this stays race-free
+                # without needing a lock on the vulnerability list itself.
+                for future in as_completed(future_to_vuln):
+                    vuln = future_to_vuln[future]
+                    suggestion = future.result()
+                    if suggestion:
+                        vuln.remediation = f"{vuln.remediation}\n\nContext-specific suggestion: {suggestion}"
+                        enriched_count += 1
 
     if client.enabled:
         state.findings.append(

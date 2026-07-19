@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import threading
 import time
 
 from .secret_redaction import redact_text
@@ -20,6 +21,13 @@ class GroqClient:
         self.call_count = 0
         self.failure_count = 0
         self.retry_count = 0
+        # A single GroqClient instance is now called concurrently from a
+        # thread pool (see classify_risk_surface.py / explain_remediate.py)
+        # to fix a real "online mode is slow" problem. This lock protects
+        # the shared counters/lazy-init above from races between threads --
+        # it never wraps the actual network call, so requests still run in
+        # parallel; only the bookkeeping around them is serialized.
+        self._lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -27,8 +35,10 @@ class GroqClient:
 
     def _get_client(self):
         if self._client is None:
-            from groq import Groq
-            self._client = Groq(api_key=self.api_key)
+            with self._lock:
+                if self._client is None:  # double-checked locking
+                    from groq import Groq
+                    self._client = Groq(api_key=self.api_key)
         return self._client
 
     @staticmethod
@@ -40,7 +50,8 @@ class GroqClient:
         return isinstance(exc, (RateLimitError, APITimeoutError, InternalServerError, APIConnectionError))
 
     def _call_with_retry(self, make_request):
-        self.call_count += 1
+        with self._lock:
+            self.call_count += 1
         last_exc: Exception | None = None
         for attempt in range(self.MAX_RETRIES + 1):
             try:
@@ -49,10 +60,12 @@ class GroqClient:
                 last_exc = e
                 if not self._is_transient(e) or attempt == self.MAX_RETRIES:
                     break
-                self.retry_count += 1
+                with self._lock:
+                    self.retry_count += 1
                 time.sleep(self.BASE_BACKOFF_SECONDS * (2 ** attempt))
-        self.failure_count += 1
-        self.last_error = f"{type(last_exc).__name__}: {last_exc}"
+        with self._lock:
+            self.failure_count += 1
+            self.last_error = f"{type(last_exc).__name__}: {last_exc}"
         return None
 
     def analyze(self, prompt: str) -> str | None:
